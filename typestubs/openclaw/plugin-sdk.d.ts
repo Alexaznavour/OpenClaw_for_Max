@@ -70,8 +70,14 @@ export interface AgentRoute {
 export interface ResolveAgentRouteParams {
   cfg: OpenClawConfig;
   channel: string;
-  accountId: string;
-  chatType: string;
+  accountId?: string | null;
+  peer?: { kind: 'direct' | 'group'; id: string } | null;
+  parentPeer?: { kind: 'direct' | 'group'; id: string } | null;
+  guildId?: string | null;
+  teamId?: string | null;
+  memberRoleIds?: string[];
+  // legacy compat
+  chatType?: string;
   peerId?: string;
   senderId?: string;
   groupId?: string;

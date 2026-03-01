@@ -14,27 +14,64 @@ For local development:
 openclaw plugins install -l ./path/to/openclaw-max
 ```
 
+### Docker Installation
+
+```bash
+# Inside the container (or via docker exec):
+node /app/openclaw.mjs plugins install /path/to/openclaw-max
+
+# Create symlink so the plugin can resolve openclaw imports:
+ln -sf /app /home/node/.openclaw/extensions/max/node_modules/openclaw
+
+# Restart the gateway:
+docker restart <container-name>
+```
+
+> **Note:** The symlink is needed because `openclaw` lives in `/app/` (gateway root) while the plugin is installed under `/home/node/.openclaw/extensions/max/`. Node.js module resolution does not traverse from extensions into `/app` without this link. The `postinstall` script in `package.json` attempts to create it automatically, but in some Docker setups you may need to do it manually.
+
 ## Configuration
+
+### Flat config (single bot, simple setup)
 
 Add your bot token to `~/.openclaw/openclaw.json`:
 
-```json5
+```json
 {
-  channels: {
-    max: {
-      enabled: true,
-      botToken: "YOUR_BOT_TOKEN_HERE",
-      dmPolicy: "open",
-      allowFrom: ["*"],
-      groups: {
-        "*": { requireMention: true }
+  "channels": {
+    "max": {
+      "enabled": true,
+      "botToken": "YOUR_BOT_TOKEN_HERE",
+      "dmPolicy": "open",
+      "allowFrom": ["*"],
+      "groups": {
+        "*": { "requireMention": true }
       }
     }
   }
 }
 ```
 
-Or use an environment variable:
+### Multi-account config
+
+```json
+{
+  "channels": {
+    "max": {
+      "enabled": true,
+      "accounts": {
+        "default": {
+          "botToken": "TOKEN_1"
+        },
+        "support": {
+          "botToken": "TOKEN_2"
+        }
+      }
+    }
+  }
+}
+```
+
+### Environment variable
 
 ```bash
 MAX_BOT_TOKEN="YOUR_BOT_TOKEN_HERE" openclaw gateway
@@ -66,27 +103,6 @@ openclaw gateway restart
 | `requireMention` | No | `true` | Require @mention in groups |
 | `mediaMaxMb` | No | `5` | Max inbound media download size (MB) |
 | `textChunkLimit` | No | `4000` | Max chars per outbound message chunk |
-
-### Multi-account support
-
-```json5
-{
-  channels: {
-    max: {
-      accounts: {
-        default: {
-          botToken: "TOKEN_1",
-          enabled: true
-        },
-        support: {
-          botToken: "TOKEN_2",
-          enabled: true
-        }
-      }
-    }
-  }
-}
-```
 
 ## Features
 

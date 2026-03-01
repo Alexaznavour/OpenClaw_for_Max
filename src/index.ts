@@ -54,8 +54,17 @@ const maxPlugin = {
   },
 
   config: {
-    listAccountIds: (cfg: OpenClawConfig): string[] =>
-      Object.keys((cfg.channels as any)?.max?.accounts ?? {}),
+    listAccountIds: (cfg: OpenClawConfig): string[] => {
+      const max = (cfg.channels as any)?.max;
+      if (!max) return [];
+      if (max.accounts && Object.keys(max.accounts).length > 0) {
+        return Object.keys(max.accounts);
+      }
+      if (max.botToken || process.env.MAX_BOT_TOKEN) {
+        return ['default'];
+      }
+      return [];
+    },
 
     resolveAccount: (
       cfg: OpenClawConfig,
@@ -85,8 +94,12 @@ const maxPlugin = {
       const adapter = adapters.get(ctx.accountId ?? 'default');
       if (!adapter) return { ok: false };
 
-      const chatId = parseInt(ctx.to, 10);
-      if (isNaN(chatId)) return { ok: false };
+      const rawTo = ctx.to?.replace(/^max:/, '') ?? '';
+      const chatId = parseInt(rawTo, 10);
+      if (isNaN(chatId)) {
+        console.error(`[MAX] sendText: invalid chatId from ctx.to="${ctx.to}"`);
+        return { ok: false };
+      }
 
       try {
         const mediaUrl = ctx.mediaUrl;
@@ -108,6 +121,7 @@ const maxPlugin = {
 
         return { ok: true };
       } catch (err) {
+        console.error('[MAX] sendText error:', err);
         return { ok: false };
       }
     },
@@ -165,13 +179,46 @@ const maxPlugin = {
             `chat=${envelope.chatId} type=${envelope.chatType}`,
           );
 
+          // ── Step 0: Check dmPolicy / groupPolicy ──
+          if (envelope.chatType === 'direct') {
+            const policy = account.dmPolicy ?? 'open';
+            if (policy === 'disabled') return;
+            if (policy === 'allowlist') {
+              const allow = account.allowFrom ?? [];
+              const senderId = String(envelope.sender.id);
+              const chatId = String(envelope.chatId);
+              if (!allow.includes('*') && !allow.includes(senderId) && !allow.includes(chatId)) {
+                log?.debug?.(`[MAX] Ignoring DM from ${senderId} (not in allowFrom)`);
+                return;
+              }
+            }
+          } else if (envelope.chatType === 'group') {
+            const chatId = String(envelope.chatId);
+            const groupCfg = account.groups?.[chatId] ?? account.groups?.['*'];
+            const groupPolicy = groupCfg?.groupPolicy ?? account.groupPolicy ?? 'disabled';
+            if (groupPolicy === 'disabled') return;
+            if (groupPolicy === 'allowlist') {
+              const allow = groupCfg?.allowFrom ?? account.groupAllowFrom ?? [];
+              const senderId = String(envelope.sender.id);
+              if (!allow.includes('*') && !allow.includes(senderId) && !allow.includes(chatId)) {
+                log?.debug?.(`[MAX] Ignoring group msg from ${senderId} in ${chatId} (not in groupAllowFrom)`);
+                return;
+              }
+            }
+          }
+
           // ── Step 1: Resolve agent route ──
           let route;
           try {
+            const peer = {
+              kind: envelope.chatType as 'direct' | 'group',
+              id: String(envelope.chatId),
+            };
             route = await rt.channel.routing.resolveAgentRoute({
               cfg,
               channel: CHANNEL_ID,
               accountId,
+              peer,
               chatType: envelope.chatType,
               peerId: envelope.sender.id,
               senderId: envelope.sender.id,
@@ -179,6 +226,15 @@ const maxPlugin = {
                 ? { groupId: String(envelope.chatId) }
                 : {}),
             });
+
+            // Fallback: override sessionKey if runtime ignored the `peer` param
+            const dmScope = (cfg as any).session?.dmScope ?? 'per-channel-peer';
+            if (envelope.chatType === 'direct' && dmScope === 'per-channel-peer') {
+              route.sessionKey = `agent:${route.agentId}:${CHANNEL_ID}:direct:${envelope.chatId}`;
+            } else if (envelope.chatType === 'group') {
+              route.sessionKey = `agent:${route.agentId}:${CHANNEL_ID}:group:${envelope.chatId}`;
+            }
+
             log?.info?.(`[MAX] Route: agent=${route.agentId} session=${route.sessionKey}`);
           } catch (err) {
             log?.error?.('[MAX] resolveAgentRoute failed:', err);

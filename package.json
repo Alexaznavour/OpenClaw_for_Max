@@ -13,6 +13,7 @@
   "scripts": {
     "build": "rm -rf dist .tsc-out && tsc && node esbuild.config.mjs",
     "prepublishOnly": "npm run build",
+    "postinstall": "node -e \"const fs=require('fs'),p=require('path');const t=p.join(__dirname,'node_modules','openclaw');if(!fs.existsSync(t)){try{const a=require.resolve('openclaw/package.json',{paths:['/app']});fs.symlinkSync(p.dirname(a),t)}catch{}}\"",
     "test": "vitest run",
     "dev": "tsc --watch"
   },
