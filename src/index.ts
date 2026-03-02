@@ -326,7 +326,7 @@ const maxPlugin = {
                 deliver: async (payload: ReplyPayload) => {
                   const text = payload.text;
                   log?.info?.(
-                    `[MAX] Deliver: text=${text ? text.slice(0, 80) + '...' : '(empty)'}`,
+                    `[MAX] Deliver payload: ${JSON.stringify(payload, null, 2)}`,
                   );
                   if (!text && !payload.mediaUrl && !payload.mediaUrls?.length) return;
 
