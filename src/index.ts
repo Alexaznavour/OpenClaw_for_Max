@@ -108,15 +108,22 @@ const maxPlugin = {
         if (mediaUrl) {
           await uploadAndSendMedia(adapter.getApi(), chatId, mediaUrl, ctx.text);
         } else if (mediaUrls?.length) {
-          // Send first media with text, rest without
           await uploadAndSendMedia(adapter.getApi(), chatId, mediaUrls[0], ctx.text);
           for (let i = 1; i < mediaUrls.length; i++) {
             await uploadAndSendMedia(adapter.getApi(), chatId, mediaUrls[i]);
           }
         } else {
-          await adapter.sendText(chatId, ctx.text, {
-            format: 'markdown',
-          });
+          const btnResult = await resolveButtons(ctx.text, ctx as Record<string, unknown>);
+          if (btnResult) {
+            await adapter.sendText(chatId, btnResult.cleanText, {
+              format: 'markdown',
+              attachments: [btnResult.keyboard],
+            });
+          } else {
+            await adapter.sendText(chatId, ctx.text, {
+              format: 'markdown',
+            });
+          }
         }
 
         return { ok: true };
@@ -326,7 +333,7 @@ const maxPlugin = {
                 deliver: async (payload: ReplyPayload) => {
                   const text = payload.text;
                   log?.info?.(
-                    `[MAX] Deliver payload: ${JSON.stringify(payload, null, 2)}`,
+                    `[MAX] Deliver: text=${text ? text.slice(0, 80) + '...' : '(empty)'}`,
                   );
                   if (!text && !payload.mediaUrl && !payload.mediaUrls?.length) return;
 
@@ -349,11 +356,31 @@ const maxPlugin = {
                       }
                     } else if (text) {
                       const chunkLimit = account.textChunkLimit ?? 4000;
-                      const chunks = chunkText(text, chunkLimit);
-                      for (const chunk of chunks) {
-                        await adapter.sendText(targetChatId, chunk, {
-                          format: 'markdown',
-                        });
+                      const btnResult = await resolveButtons(text, payload as Record<string, unknown>);
+
+                      if (btnResult) {
+                        const chunks = chunkText(btnResult.cleanText, chunkLimit);
+                        for (let i = 0; i < chunks.length - 1; i++) {
+                          await adapter.sendText(targetChatId, chunks[i], {
+                            format: 'markdown',
+                          });
+                        }
+                        await adapter.sendText(
+                          targetChatId,
+                          chunks[chunks.length - 1] || '',
+                          {
+                            format: 'markdown',
+                            attachments: [btnResult.keyboard],
+                          },
+                        );
+                        log?.info?.(`[MAX] Sent with inline keyboard (${btnResult.cleanText.length} chars)`);
+                      } else {
+                        const chunks = chunkText(text, chunkLimit);
+                        for (const chunk of chunks) {
+                          await adapter.sendText(targetChatId, chunk, {
+                            format: 'markdown',
+                          });
+                        }
                       }
                     }
                   } catch (err) {
@@ -403,6 +430,104 @@ const maxPlugin = {
     },
   },
 };
+
+// ── Inline buttons support ──
+
+interface ParsedButton {
+  text: string;
+  payload?: string;
+  url?: string;
+}
+
+/**
+ * Extract inline button markup from text.
+ * Syntax: [[Button Text]] or [[Button Text|callback_data]] or [[Button Text|https://example.com]]
+ * Buttons on the same line form a single row.
+ */
+function extractInlineButtons(text: string): {
+  cleanText: string;
+  rows: ParsedButton[][];
+} | null {
+  const btnRe = /\[\[([^\]|]+?)(?:\|(.*?))?\]\]/g;
+  const lines = text.split('\n');
+  const clean: string[] = [];
+  const rows: ParsedButton[][] = [];
+
+  for (const line of lines) {
+    const matches = [...line.matchAll(btnRe)];
+    if (matches.length === 0) {
+      clean.push(line);
+      continue;
+    }
+    const row: ParsedButton[] = [];
+    for (const m of matches) {
+      const label = m[1].trim();
+      const value = m[2]?.trim();
+      if (value && /^https?:\/\//.test(value)) {
+        row.push({ text: label, url: value });
+      } else {
+        row.push({ text: label, payload: value || label });
+      }
+    }
+    rows.push(row);
+    const leftover = line.replace(btnRe, '').trim();
+    if (leftover) clean.push(leftover);
+  }
+
+  if (rows.length === 0) return null;
+  return {
+    cleanText: clean.join('\n').replace(/\n{3,}/g, '\n\n').trim(),
+    rows,
+  };
+}
+
+/**
+ * Build a MAX InlineKeyboardAttachment from parsed button rows.
+ * Uses Keyboard helpers from @maxhub/max-bot-api.
+ */
+async function buildMaxKeyboard(rows: ParsedButton[][]): Promise<unknown> {
+  const { Keyboard } = await import('@maxhub/max-bot-api');
+  const kbRows = rows.map(row =>
+    row.map(btn =>
+      btn.url
+        ? Keyboard.button.link(btn.text, btn.url)
+        : Keyboard.button.callback(btn.text, btn.payload ?? btn.text)
+    )
+  );
+  return Keyboard.inlineKeyboard(kbRows);
+}
+
+/**
+ * Read buttons from channelData.max.buttons (structured) or parse [[markup]] from text.
+ * Returns keyboard attachment and cleaned text, or null if no buttons.
+ */
+async function resolveButtons(
+  text: string | undefined,
+  payload: Record<string, unknown>,
+): Promise<{ cleanText: string; keyboard: unknown } | null> {
+  const maxData = (payload.channelData as any)?.max;
+  if (maxData?.buttons?.length) {
+    const rows: ParsedButton[][] = maxData.buttons.map((row: any[]) =>
+      row.map((btn: any) => ({
+        text: btn.text ?? btn.label ?? '',
+        payload: btn.payload ?? btn.callback_data,
+        url: btn.url,
+      }))
+    );
+    return {
+      cleanText: text ?? '',
+      keyboard: await buildMaxKeyboard(rows),
+    };
+  }
+
+  if (!text) return null;
+  const parsed = extractInlineButtons(text);
+  if (!parsed) return null;
+  return {
+    cleanText: parsed.cleanText,
+    keyboard: await buildMaxKeyboard(parsed.rows),
+  };
+}
 
 /**
  * Split long text into chunks respecting a character limit.
