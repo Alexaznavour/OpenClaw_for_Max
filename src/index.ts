@@ -441,14 +441,15 @@ interface ParsedButton {
 
 /**
  * Extract inline button markup from text.
- * Syntax: [[Button Text]] or [[Button Text|callback_data]] or [[Button Text|https://example.com]]
+ * Syntax: <<Button Text>> or <<Button Text|callback_data>> or <<Button Text|https://example.com>>
+ * Uses double angle brackets to avoid collisions with JSON arrays, Markdown links, etc.
  * Buttons on the same line form a single row.
  */
 function extractInlineButtons(text: string): {
   cleanText: string;
   rows: ParsedButton[][];
 } | null {
-  const btnRe = /\[\[([^\]|]+?)(?:\|(.*?))?\]\]/g;
+  const btnRe = /<<([^>|]+?)(?:\|(.*?))?>>/g;
   const lines = text.split('\n');
   const clean: string[] = [];
   const rows: ParsedButton[][] = [];
@@ -470,7 +471,7 @@ function extractInlineButtons(text: string): {
       }
     }
     rows.push(row);
-    const leftover = line.replace(btnRe, '').trim();
+    const leftover = line.replace(/<<([^>|]+?)(?:\|(.*?))?>>/g, '').trim();
     if (leftover) clean.push(leftover);
   }
 
