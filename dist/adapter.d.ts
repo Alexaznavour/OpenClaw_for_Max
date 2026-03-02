@@ -15,13 +15,16 @@ export interface MaxAdapterOptions {
 }
 /**
  * Adapter that wraps @maxhub/max-bot-api Bot class.
- * Uses Long Polling to receive updates and provides outbound send methods.
+ * Uses Long Polling with supervised auto-reconnect on transient errors.
  */
 export declare class MaxAdapter {
     private readonly opts;
     private bot;
     private api;
     private stopped;
+    private BotClass;
+    private lastPollOk;
+    private reconnectAttempt;
     private readonly token;
     private readonly mediaMaxMb;
     private readonly onMessage;
@@ -30,24 +33,23 @@ export declare class MaxAdapter {
     private readonly logger;
     constructor(opts: MaxAdapterOptions);
     /**
-     * Start Long Polling and register update handlers.
+     * Start Long Polling with supervised reconnect loop.
      */
     start(): Promise<void>;
     /**
-     * Stop Long Polling and clean up.
+     * Create a fresh Bot instance, register handlers, verify connection, start polling.
+     * On polling crash — automatically retries with backoff unless stopped.
+     */
+    private connectAndPoll;
+    private registerHandlers;
+    private cleanupBot;
+    private sleep;
+    /**
+     * Stop Long Polling and clean up. Only called on abort signal or explicit stop.
      */
     stop(): void;
-    /**
-     * Get the underlying MAX Bot API instance for outbound operations.
-     */
     getApi(): any;
-    /**
-     * Send a text message to a chat.
-     */
     sendText(chatId: number, text: string, extra?: Record<string, unknown>): Promise<void>;
-    /**
-     * Send a text message with a reply link to the original message.
-     */
     sendReply(chatId: number, text: string, replyToMid: string, extra?: Record<string, unknown>): Promise<void>;
     isStopped(): boolean;
 }

@@ -3377,11 +3377,29 @@ function normalizeCallback(update) {
 }
 
 // .tsc-out/adapter.js
+var BACKOFF_STEPS = [1e3, 2e3, 5e3, 1e4, 3e4];
+function formatError(err) {
+  if (err instanceof Error)
+    return err.stack ?? err.message;
+  if (typeof err === "string")
+    return err;
+  try {
+    return JSON.stringify(err);
+  } catch {
+    return String(err);
+  }
+}
+function backoffDelay(attempt) {
+  return BACKOFF_STEPS[Math.min(attempt, BACKOFF_STEPS.length - 1)];
+}
 var MaxAdapter = class {
   opts;
   bot = null;
   api = null;
   stopped = false;
+  BotClass = null;
+  lastPollOk = null;
+  reconnectAttempt = 0;
   token;
   mediaMaxMb;
   onMessage;
@@ -3401,24 +3419,62 @@ var MaxAdapter = class {
     }
   }
   /**
-   * Start Long Polling and register update handlers.
+   * Start Long Polling with supervised reconnect loop.
    */
   async start() {
     if (this.stopped)
       return;
     const maxBotApi = await Promise.resolve().then(() => __toESM(require_dist(), 1));
-    const Bot = maxBotApi.Bot;
-    this.bot = new Bot(this.token);
-    this.api = this.bot.api;
+    this.BotClass = maxBotApi.Bot;
+    await this.connectAndPoll();
+  }
+  /**
+   * Create a fresh Bot instance, register handlers, verify connection, start polling.
+   * On polling crash — automatically retries with backoff unless stopped.
+   */
+  async connectAndPoll() {
+    while (!this.stopped) {
+      try {
+        this.bot = new this.BotClass(this.token);
+        this.api = this.bot.api;
+        this.registerHandlers();
+        const info = await this.api.getMyInfo();
+        this.logger.info?.(`[MAX] Connected as @${info.username ?? info.name ?? "bot"}`);
+        this.lastPollOk = Date.now();
+        if (this.reconnectAttempt > 0) {
+          this.logger.info?.(`[MAX] Polling resumed after ${this.reconnectAttempt} reconnect attempt(s)`);
+        }
+        this.reconnectAttempt = 0;
+        this.onReady?.();
+        this.logger.info?.("[MAX] Starting Long Polling...");
+        await this.bot.start();
+        if (!this.stopped) {
+          this.logger.warn?.("[MAX] bot.start() exited unexpectedly, will reconnect");
+        }
+      } catch (err) {
+        if (this.stopped)
+          return;
+        const delay = backoffDelay(this.reconnectAttempt);
+        this.reconnectAttempt++;
+        this.logger.error?.(`[MAX] Polling failed (attempt #${this.reconnectAttempt}, last ok: ${this.lastPollOk ? new Date(this.lastPollOk).toISOString() : "never"}): ` + formatError(err));
+        this.logger.info?.(`[MAX] Reconnecting in ${delay / 1e3}s...`);
+        this.onError?.(err);
+        this.cleanupBot();
+        await this.sleep(delay);
+      }
+    }
+  }
+  registerHandlers() {
     this.bot.on("bot_started", async (ctx) => {
       try {
         const update = ctx.update;
         const envelope = normalizeBotStarted(update);
         if (envelope) {
+          this.lastPollOk = Date.now();
           await this.onMessage(envelope);
         }
       } catch (err) {
-        this.logger.error?.("[MAX] Error handling bot_started:", err);
+        this.logger.error?.(`[MAX] Error handling bot_started: ${formatError(err)}`);
         this.onError?.(err);
       }
     });
@@ -3427,10 +3483,11 @@ var MaxAdapter = class {
         const update = ctx.update;
         const envelope = await normalizeMessage(update, this.mediaMaxMb);
         if (envelope) {
+          this.lastPollOk = Date.now();
           await this.onMessage(envelope);
         }
       } catch (err) {
-        this.logger.error?.("[MAX] Error handling message_created:", err);
+        this.logger.error?.(`[MAX] Error handling message_created: ${formatError(err)}`);
         this.onError?.(err);
       }
     });
@@ -3440,10 +3497,11 @@ var MaxAdapter = class {
         const envelope = await normalizeMessage(update, this.mediaMaxMb);
         if (envelope) {
           envelope.metadata.edited = true;
+          this.lastPollOk = Date.now();
           await this.onMessage(envelope);
         }
       } catch (err) {
-        this.logger.error?.("[MAX] Error handling message_edited:", err);
+        this.logger.error?.(`[MAX] Error handling message_edited: ${formatError(err)}`);
         this.onError?.(err);
       }
     });
@@ -3452,62 +3510,60 @@ var MaxAdapter = class {
         const update = ctx.update;
         const envelope = normalizeCallback(update);
         if (envelope) {
+          this.lastPollOk = Date.now();
           await this.onMessage(envelope);
         }
       } catch (err) {
-        this.logger.error?.("[MAX] Error handling message_callback:", err);
+        this.logger.error?.(`[MAX] Error handling message_callback: ${formatError(err)}`);
         this.onError?.(err);
       }
     });
     this.bot.catch((err) => {
-      this.logger.error?.("[MAX] Bot error:", err);
+      this.logger.error?.(`[MAX] Bot catch handler: ${formatError(err)}`);
       this.onError?.(err);
     });
-    this.logger.info?.("[MAX] Starting Long Polling...");
+  }
+  cleanupBot() {
     try {
-      const info = await this.api.getMyInfo();
-      this.logger.info?.(`[MAX] Connected as @${info.username ?? info.name ?? "bot"}`);
-      this.onReady?.();
-    } catch (err) {
-      this.logger.error?.("[MAX] Failed to fetch bot info:", err);
+      this.bot?.stop?.();
+    } catch {
     }
-    this.bot.start().catch((err) => {
-      if (!this.stopped) {
-        this.logger.error?.("[MAX] Polling loop error:", err);
-        this.onError?.(err);
+    this.bot = null;
+  }
+  sleep(ms) {
+    return new Promise((resolve) => {
+      if (this.stopped) {
+        resolve();
+        return;
+      }
+      const timer = setTimeout(resolve, ms);
+      if (this.opts.signal) {
+        const onAbort = () => {
+          clearTimeout(timer);
+          resolve();
+        };
+        this.opts.signal.addEventListener("abort", onAbort, { once: true });
       }
     });
   }
   /**
-   * Stop Long Polling and clean up.
+   * Stop Long Polling and clean up. Only called on abort signal or explicit stop.
    */
   stop() {
     if (this.stopped)
       return;
     this.stopped = true;
-    try {
-      this.bot?.stop?.();
-    } catch {
-    }
+    this.cleanupBot();
     this.logger.info?.("[MAX] Adapter stopped");
   }
-  /**
-   * Get the underlying MAX Bot API instance for outbound operations.
-   */
   getApi() {
     return this.api;
   }
-  /**
-   * Send a text message to a chat.
-   */
   async sendText(chatId, text, extra) {
     if (!this.api)
       throw new Error("MAX adapter not started");
     await this.api.sendMessageToChat(chatId, text, extra);
   }
-  /**
-   * Send a text message with a reply link to the original message.
-   */
   async sendReply(chatId, text, replyToMid, extra) {
     if (!this.api)
       throw new Error("MAX adapter not started");
@@ -3523,6 +3579,17 @@ var MaxAdapter = class {
 
 // .tsc-out/index.js
 var CHANNEL_ID2 = "max";
+function formatError2(err) {
+  if (err instanceof Error)
+    return err.stack ?? err.message;
+  if (typeof err === "string")
+    return err;
+  try {
+    return JSON.stringify(err);
+  } catch {
+    return String(err);
+  }
+}
 var adapters = /* @__PURE__ */ new Map();
 var maxPlugin = {
   id: CHANNEL_ID2,
@@ -3649,10 +3716,12 @@ var maxPlugin = {
           log?.info?.("[MAX] Bot connected and polling");
         },
         onError: (err) => {
-          log?.error?.("[MAX] Adapter error:", err);
+          const detail = err instanceof Error ? err.stack ?? err.message : String(err);
+          log?.error?.(`[MAX] Adapter error: ${detail}`);
           ctx.setStatus({
             ...ctx.getStatus(),
-            lastError: String(err)
+            lastError: detail,
+            lastErrorAt: Date.now()
           });
         },
         onMessage: async (envelope) => {
@@ -3709,7 +3778,7 @@ var maxPlugin = {
             }
             log?.info?.(`[MAX] Route: agent=${route.agentId} session=${route.sessionKey}`);
           } catch (err) {
-            log?.error?.("[MAX] resolveAgentRoute failed:", err);
+            log?.error?.(`[MAX] resolveAgentRoute failed: ${formatError2(err)}`);
             throw err;
           }
           const rawCtx = {
@@ -3746,7 +3815,7 @@ var maxPlugin = {
             msgCtx = rt.channel.reply.finalizeInboundContext(rawCtx);
             log?.info?.(`[MAX] Finalized, CommandAuthorized=${msgCtx.CommandAuthorized}`);
           } catch (err) {
-            log?.error?.("[MAX] finalizeInboundContext failed:", err);
+            log?.error?.(`[MAX] finalizeInboundContext failed: ${formatError2(err)}`);
             throw err;
           }
           try {
@@ -3763,12 +3832,12 @@ var maxPlugin = {
                 accountId
               },
               onRecordError: (err) => {
-                log?.error?.("[MAX] recordInboundSession onRecordError:", err);
+                log?.error?.(`[MAX] recordInboundSession onRecordError: ${formatError2(err)}`);
               }
             });
             log?.info?.("[MAX] Session recorded");
           } catch (err) {
-            log?.error?.("[MAX] recordInboundSession failed:", err);
+            log?.error?.(`[MAX] recordInboundSession failed: ${formatError2(err)}`);
             throw err;
           }
           try {
@@ -3818,17 +3887,17 @@ var maxPlugin = {
                       }
                     }
                   } catch (err) {
-                    log?.error?.("[MAX] Deliver error:", err);
+                    log?.error?.(`[MAX] Deliver error: ${formatError2(err)}`);
                   }
                 },
                 onError: (err, info) => {
-                  log?.error?.(`[MAX] Dispatch onError (${info.kind}):`, err);
+                  log?.error?.(`[MAX] Dispatch onError (${info.kind}): ${formatError2(err)}`);
                 }
               }
             });
             log?.info?.("[MAX] Dispatch complete");
           } catch (err) {
-            log?.error?.("[MAX] Dispatch failed:", err);
+            log?.error?.(`[MAX] Dispatch failed: ${formatError2(err)}`);
             throw err;
           }
         }

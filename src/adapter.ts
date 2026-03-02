@@ -17,14 +17,30 @@ export interface MaxAdapterOptions {
   signal?: AbortSignal;
 }
 
+const BACKOFF_STEPS = [1_000, 2_000, 5_000, 10_000, 30_000];
+
+function formatError(err: unknown): string {
+  if (err instanceof Error) return err.stack ?? err.message;
+  if (typeof err === 'string') return err;
+  try { return JSON.stringify(err); } catch { return String(err); }
+}
+
+function backoffDelay(attempt: number): number {
+  return BACKOFF_STEPS[Math.min(attempt, BACKOFF_STEPS.length - 1)];
+}
+
 /**
  * Adapter that wraps @maxhub/max-bot-api Bot class.
- * Uses Long Polling to receive updates and provides outbound send methods.
+ * Uses Long Polling with supervised auto-reconnect on transient errors.
  */
 export class MaxAdapter {
   private bot: any = null;
   private api: any = null;
   private stopped = false;
+  private BotClass: any = null;
+
+  private lastPollOk: number | null = null;
+  private reconnectAttempt = 0;
 
   private readonly token: string;
   private readonly mediaMaxMb: number;
@@ -47,125 +63,165 @@ export class MaxAdapter {
   }
 
   /**
-   * Start Long Polling and register update handlers.
+   * Start Long Polling with supervised reconnect loop.
    */
   async start(): Promise<void> {
     if (this.stopped) return;
 
-    // Dynamic import so the module is resolved at runtime by the host
     const maxBotApi = await import('@maxhub/max-bot-api');
-    const Bot = maxBotApi.Bot;
+    this.BotClass = maxBotApi.Bot;
 
-    this.bot = new Bot(this.token);
-    this.api = this.bot.api;
+    await this.connectAndPoll();
+  }
 
-    // Handle /start (bot_started)
+  /**
+   * Create a fresh Bot instance, register handlers, verify connection, start polling.
+   * On polling crash — automatically retries with backoff unless stopped.
+   */
+  private async connectAndPoll(): Promise<void> {
+    while (!this.stopped) {
+      try {
+        this.bot = new this.BotClass(this.token);
+        this.api = this.bot.api;
+
+        this.registerHandlers();
+
+        const info = await this.api.getMyInfo();
+        this.logger.info?.(
+          `[MAX] Connected as @${info.username ?? info.name ?? 'bot'}`,
+        );
+        this.lastPollOk = Date.now();
+
+        if (this.reconnectAttempt > 0) {
+          this.logger.info?.(
+            `[MAX] Polling resumed after ${this.reconnectAttempt} reconnect attempt(s)`,
+          );
+        }
+        this.reconnectAttempt = 0;
+        this.onReady?.();
+
+        this.logger.info?.('[MAX] Starting Long Polling...');
+        await this.bot.start();
+
+        // bot.start() resolved normally — means it was stopped cleanly
+        if (!this.stopped) {
+          this.logger.warn?.('[MAX] bot.start() exited unexpectedly, will reconnect');
+        }
+      } catch (err) {
+        if (this.stopped) return;
+
+        const delay = backoffDelay(this.reconnectAttempt);
+        this.reconnectAttempt++;
+
+        this.logger.error?.(
+          `[MAX] Polling failed (attempt #${this.reconnectAttempt}, ` +
+          `last ok: ${this.lastPollOk ? new Date(this.lastPollOk).toISOString() : 'never'}): ` +
+          formatError(err),
+        );
+        this.logger.info?.(`[MAX] Reconnecting in ${delay / 1000}s...`);
+
+        this.onError?.(err);
+        this.cleanupBot();
+
+        await this.sleep(delay);
+      }
+    }
+  }
+
+  private registerHandlers(): void {
     this.bot.on('bot_started', async (ctx: any) => {
       try {
         const update = ctx.update as MaxUpdate;
         const envelope = normalizeBotStarted(update);
         if (envelope) {
+          this.lastPollOk = Date.now();
           await this.onMessage(envelope);
         }
       } catch (err) {
-        this.logger.error?.('[MAX] Error handling bot_started:', err);
+        this.logger.error?.(`[MAX] Error handling bot_started: ${formatError(err)}`);
         this.onError?.(err);
       }
     });
 
-    // Handle new messages (text, voice, images, etc.)
     this.bot.on('message_created', async (ctx: any) => {
       try {
         const update = ctx.update as MaxUpdate;
         const envelope = await normalizeMessage(update, this.mediaMaxMb);
         if (envelope) {
+          this.lastPollOk = Date.now();
           await this.onMessage(envelope);
         }
       } catch (err) {
-        this.logger.error?.('[MAX] Error handling message_created:', err);
+        this.logger.error?.(`[MAX] Error handling message_created: ${formatError(err)}`);
         this.onError?.(err);
       }
     });
 
-    // Handle edited messages
     this.bot.on('message_edited', async (ctx: any) => {
       try {
         const update = ctx.update as MaxUpdate;
         const envelope = await normalizeMessage(update, this.mediaMaxMb);
         if (envelope) {
           envelope.metadata.edited = true;
+          this.lastPollOk = Date.now();
           await this.onMessage(envelope);
         }
       } catch (err) {
-        this.logger.error?.('[MAX] Error handling message_edited:', err);
+        this.logger.error?.(`[MAX] Error handling message_edited: ${formatError(err)}`);
         this.onError?.(err);
       }
     });
 
-    // Handle inline button callbacks
     this.bot.on('message_callback', async (ctx: any) => {
       try {
         const update = ctx.update as MaxUpdate;
         const envelope = normalizeCallback(update);
         if (envelope) {
+          this.lastPollOk = Date.now();
           await this.onMessage(envelope);
         }
       } catch (err) {
-        this.logger.error?.('[MAX] Error handling message_callback:', err);
+        this.logger.error?.(`[MAX] Error handling message_callback: ${formatError(err)}`);
         this.onError?.(err);
       }
     });
 
-    // Handle errors
     this.bot.catch((err: unknown) => {
-      this.logger.error?.('[MAX] Bot error:', err);
+      this.logger.error?.(`[MAX] Bot catch handler: ${formatError(err)}`);
       this.onError?.(err);
     });
+  }
 
-    this.logger.info?.('[MAX] Starting Long Polling...');
+  private cleanupBot(): void {
+    try { this.bot?.stop?.(); } catch { /* ignore */ }
+    this.bot = null;
+  }
 
-    // Fetch bot info to confirm connection, then start polling
-    try {
-      const info = await this.api.getMyInfo();
-      this.logger.info?.(`[MAX] Connected as @${info.username ?? info.name ?? 'bot'}`);
-      this.onReady?.();
-    } catch (err) {
-      this.logger.error?.('[MAX] Failed to fetch bot info:', err);
-    }
-
-    // bot.start() runs Long Polling in a loop — it never resolves until stopped
-    this.bot.start().catch((err: unknown) => {
-      if (!this.stopped) {
-        this.logger.error?.('[MAX] Polling loop error:', err);
-        this.onError?.(err);
+  private sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => {
+      if (this.stopped) { resolve(); return; }
+      const timer = setTimeout(resolve, ms);
+      if (this.opts.signal) {
+        const onAbort = () => { clearTimeout(timer); resolve(); };
+        this.opts.signal.addEventListener('abort', onAbort, { once: true });
       }
     });
   }
 
   /**
-   * Stop Long Polling and clean up.
+   * Stop Long Polling and clean up. Only called on abort signal or explicit stop.
    */
   stop(): void {
     if (this.stopped) return;
     this.stopped = true;
-    try {
-      this.bot?.stop?.();
-    } catch {
-      // ignore stop errors
-    }
+    this.cleanupBot();
     this.logger.info?.('[MAX] Adapter stopped');
   }
 
-  /**
-   * Get the underlying MAX Bot API instance for outbound operations.
-   */
   getApi(): any {
     return this.api;
   }
 
-  /**
-   * Send a text message to a chat.
-   */
   async sendText(
     chatId: number,
     text: string,
@@ -175,9 +231,6 @@ export class MaxAdapter {
     await this.api.sendMessageToChat(chatId, text, extra);
   }
 
-  /**
-   * Send a text message with a reply link to the original message.
-   */
   async sendReply(
     chatId: number,
     text: string,

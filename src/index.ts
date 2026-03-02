@@ -15,6 +15,12 @@ import type { MaxAccountConfig, MessageEnvelope } from './types.js';
 
 const CHANNEL_ID = 'max';
 
+function formatError(err: unknown): string {
+  if (err instanceof Error) return err.stack ?? err.message;
+  if (typeof err === 'string') return err;
+  try { return JSON.stringify(err); } catch { return String(err); }
+}
+
 const adapters = new Map<string, MaxAdapter>();
 
 const maxPlugin = {
@@ -173,10 +179,12 @@ const maxPlugin = {
         },
 
         onError: (err) => {
-          log?.error?.('[MAX] Adapter error:', err);
+          const detail = err instanceof Error ? (err.stack ?? err.message) : String(err);
+          log?.error?.(`[MAX] Adapter error: ${detail}`);
           ctx.setStatus({
             ...ctx.getStatus(),
-            lastError: String(err),
+            lastError: detail,
+            lastErrorAt: Date.now(),
           });
         },
 
@@ -244,7 +252,7 @@ const maxPlugin = {
 
             log?.info?.(`[MAX] Route: agent=${route.agentId} session=${route.sessionKey}`);
           } catch (err) {
-            log?.error?.('[MAX] resolveAgentRoute failed:', err);
+            log?.error?.(`[MAX] resolveAgentRoute failed: ${formatError(err)}`);
             throw err;
           }
 
@@ -288,7 +296,7 @@ const maxPlugin = {
             msgCtx = rt.channel.reply.finalizeInboundContext(rawCtx);
             log?.info?.(`[MAX] Finalized, CommandAuthorized=${msgCtx.CommandAuthorized}`);
           } catch (err) {
-            log?.error?.('[MAX] finalizeInboundContext failed:', err);
+            log?.error?.(`[MAX] finalizeInboundContext failed: ${formatError(err)}`);
             throw err;
           }
 
@@ -313,12 +321,12 @@ const maxPlugin = {
                 accountId,
               },
               onRecordError: (err: unknown) => {
-                log?.error?.('[MAX] recordInboundSession onRecordError:', err);
+                log?.error?.(`[MAX] recordInboundSession onRecordError: ${formatError(err)}`);
               },
             });
             log?.info?.('[MAX] Session recorded');
           } catch (err) {
-            log?.error?.('[MAX] recordInboundSession failed:', err);
+            log?.error?.(`[MAX] recordInboundSession failed: ${formatError(err)}`);
             throw err;
           }
 
@@ -384,17 +392,17 @@ const maxPlugin = {
                       }
                     }
                   } catch (err) {
-                    log?.error?.('[MAX] Deliver error:', err);
+                    log?.error?.(`[MAX] Deliver error: ${formatError(err)}`);
                   }
                 },
                 onError: (err, info) => {
-                  log?.error?.(`[MAX] Dispatch onError (${info.kind}):`, err);
+                  log?.error?.(`[MAX] Dispatch onError (${info.kind}): ${formatError(err)}`);
                 },
               },
             });
             log?.info?.('[MAX] Dispatch complete');
           } catch (err) {
-            log?.error?.('[MAX] Dispatch failed:', err);
+            log?.error?.(`[MAX] Dispatch failed: ${formatError(err)}`);
             throw err;
           }
         },
