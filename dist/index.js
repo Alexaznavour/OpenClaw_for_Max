@@ -3669,7 +3669,8 @@ var maxPlugin = {
         } else {
           const btnResult = await resolveButtons(ctx.text, ctx);
           if (btnResult) {
-            await adapter.sendText(chatId, btnResult.cleanText, {
+            const safeText = btnResult.cleanText.trim() || "\u0412\u044B\u0431\u0435\u0440\u0438\u0442\u0435 \u0432\u0430\u0440\u0438\u0430\u043D\u0442:";
+            await adapter.sendText(chatId, safeText, {
               format: "markdown",
               attachments: [btnResult.keyboard]
             });
@@ -3866,17 +3867,18 @@ var maxPlugin = {
                       const chunkLimit = account.textChunkLimit ?? 4e3;
                       const btnResult = await resolveButtons(text, payload);
                       if (btnResult) {
-                        const chunks = chunkText(btnResult.cleanText, chunkLimit);
+                        const safeText = btnResult.cleanText.trim() || "\u0412\u044B\u0431\u0435\u0440\u0438\u0442\u0435 \u0432\u0430\u0440\u0438\u0430\u043D\u0442:";
+                        const chunks = chunkText(safeText, chunkLimit);
                         for (let i = 0; i < chunks.length - 1; i++) {
                           await adapter.sendText(targetChatId, chunks[i], {
                             format: "markdown"
                           });
                         }
-                        await adapter.sendText(targetChatId, chunks[chunks.length - 1] || "", {
+                        await adapter.sendText(targetChatId, chunks[chunks.length - 1], {
                           format: "markdown",
                           attachments: [btnResult.keyboard]
                         });
-                        log?.info?.(`[MAX] Sent with inline keyboard (${btnResult.cleanText.length} chars)`);
+                        log?.info?.(`[MAX] Sent with inline keyboard (${safeText.length} chars)`);
                       } else {
                         const chunks = chunkText(text, chunkLimit);
                         for (const chunk of chunks) {

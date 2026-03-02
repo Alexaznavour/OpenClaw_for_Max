@@ -121,7 +121,8 @@ const maxPlugin = {
         } else {
           const btnResult = await resolveButtons(ctx.text, ctx as Record<string, unknown>);
           if (btnResult) {
-            await adapter.sendText(chatId, btnResult.cleanText, {
+            const safeText = btnResult.cleanText.trim() || 'Выберите вариант:';
+            await adapter.sendText(chatId, safeText, {
               format: 'markdown',
               attachments: [btnResult.keyboard],
             });
@@ -367,7 +368,8 @@ const maxPlugin = {
                       const btnResult = await resolveButtons(text, payload as Record<string, unknown>);
 
                       if (btnResult) {
-                        const chunks = chunkText(btnResult.cleanText, chunkLimit);
+                        const safeText = btnResult.cleanText.trim() || 'Выберите вариант:';
+                        const chunks = chunkText(safeText, chunkLimit);
                         for (let i = 0; i < chunks.length - 1; i++) {
                           await adapter.sendText(targetChatId, chunks[i], {
                             format: 'markdown',
@@ -375,13 +377,13 @@ const maxPlugin = {
                         }
                         await adapter.sendText(
                           targetChatId,
-                          chunks[chunks.length - 1] || '',
+                          chunks[chunks.length - 1],
                           {
                             format: 'markdown',
                             attachments: [btnResult.keyboard],
                           },
                         );
-                        log?.info?.(`[MAX] Sent with inline keyboard (${btnResult.cleanText.length} chars)`);
+                        log?.info?.(`[MAX] Sent with inline keyboard (${safeText.length} chars)`);
                       } else {
                         const chunks = chunkText(text, chunkLimit);
                         for (const chunk of chunks) {
