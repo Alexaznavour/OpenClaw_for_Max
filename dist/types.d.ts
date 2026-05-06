@@ -1,6 +1,12 @@
 export interface MaxAccountConfig {
     botToken: string;
     enabled?: boolean;
+    deliveryMode?: 'webhook' | 'polling';
+    webhookUrl?: string;
+    webhookPath?: string;
+    webhookSecret?: string;
+    webhookUpdateTypes?: string[];
+    autoSubscribe?: boolean;
     dmPolicy?: 'pairing' | 'allowlist' | 'open' | 'disabled';
     allowFrom?: string[];
     groupPolicy?: 'open' | 'allowlist' | 'disabled';
