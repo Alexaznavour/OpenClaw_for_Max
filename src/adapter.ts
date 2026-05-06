@@ -17,6 +17,8 @@ export interface MaxAdapterOptions {
   signal?: AbortSignal;
 }
 
+export type MaxAdapterMode = 'webhook' | 'polling';
+
 const BACKOFF_STEPS = [1_000, 2_000, 5_000, 10_000, 30_000];
 
 function formatError(err: unknown): string {
@@ -29,9 +31,20 @@ function backoffDelay(attempt: number): number {
   return BACKOFF_STEPS[Math.min(attempt, BACKOFF_STEPS.length - 1)];
 }
 
+function webhookUpdateKey(update: MaxUpdate): string {
+  const messageId = update.message?.body?.mid ?? update.message_id;
+  const callbackId = update.callback?.callback_id;
+  const actorId = update.user?.user_id ?? update.callback?.user?.user_id ?? update.message?.sender?.user_id;
+  const chatId = update.chat_id ?? update.message?.recipient?.chat_id;
+  const stableId = messageId ?? callbackId ?? `${chatId ?? 'chat'}:${actorId ?? 'user'}:${update.timestamp}`;
+  return `${update.update_type}:${stableId}`;
+}
+
 /**
  * Adapter that wraps @maxhub/max-bot-api Bot class.
- * Uses Long Polling with supervised auto-reconnect on transient errors.
+ * Webhook mode initializes the MAX API client for outbound calls and accepts
+ * updates through handleWebhookUpdate(). Polling remains available as an
+ * explicit fallback for local development.
  */
 export class MaxAdapter {
   private bot: any = null;
@@ -41,6 +54,8 @@ export class MaxAdapter {
 
   private lastPollOk: number | null = null;
   private reconnectAttempt = 0;
+  private readonly seenWebhookUpdateKeys = new Set<string>();
+  private readonly seenWebhookUpdateQueue: string[] = [];
 
   private readonly token: string;
   private readonly mediaMaxMb: number;
@@ -63,15 +78,58 @@ export class MaxAdapter {
   }
 
   /**
-   * Start Long Polling with supervised reconnect loop.
+   * Start the adapter in webhook mode by default.
    */
-  async start(): Promise<void> {
+  async start(mode: MaxAdapterMode = this.opts.config.deliveryMode ?? 'webhook'): Promise<void> {
+    if (mode === 'polling') {
+      await this.startPolling();
+      return;
+    }
+    await this.startWebhook();
+  }
+
+  /**
+   * Initialize MAX API without starting Long Polling.
+   */
+  async startWebhook(): Promise<void> {
+    if (this.stopped) return;
+
+    await this.initializeBot(false);
+    this.onReady?.();
+    this.logger.info?.('[MAX] Webhook adapter ready');
+  }
+
+  /**
+   * Start Long Polling with supervised reconnect loop. This is intended only
+   * as an explicit fallback because MAX now limits Long Polling in production.
+   */
+  async startPolling(): Promise<void> {
     if (this.stopped) return;
 
     const maxBotApi = await import('@maxhub/max-bot-api');
     this.BotClass = maxBotApi.Bot;
 
     await this.connectAndPoll();
+  }
+
+  private async initializeBot(registerHandlers: boolean): Promise<void> {
+    if (!this.BotClass) {
+      const maxBotApi = await import('@maxhub/max-bot-api');
+      this.BotClass = maxBotApi.Bot;
+    }
+
+    this.cleanupBot();
+    this.bot = new this.BotClass(this.token);
+    this.api = this.bot.api;
+
+    if (registerHandlers) {
+      this.registerHandlers();
+    }
+
+    const info = await this.api.getMyInfo();
+    this.logger.info?.(
+      `[MAX] Connected as @${info.username ?? info.name ?? 'bot'}`,
+    );
   }
 
   /**
@@ -81,15 +139,7 @@ export class MaxAdapter {
   private async connectAndPoll(): Promise<void> {
     while (!this.stopped) {
       try {
-        this.bot = new this.BotClass(this.token);
-        this.api = this.bot.api;
-
-        this.registerHandlers();
-
-        const info = await this.api.getMyInfo();
-        this.logger.info?.(
-          `[MAX] Connected as @${info.username ?? info.name ?? 'bot'}`,
-        );
+        await this.initializeBot(true);
         this.lastPollOk = Date.now();
 
         if (this.reconnectAttempt > 0) {
@@ -130,60 +180,19 @@ export class MaxAdapter {
 
   private registerHandlers(): void {
     this.bot.on('bot_started', async (ctx: any) => {
-      try {
-        const update = ctx.update as MaxUpdate;
-        const envelope = normalizeBotStarted(update);
-        if (envelope) {
-          this.lastPollOk = Date.now();
-          await this.onMessage(envelope);
-        }
-      } catch (err) {
-        this.logger.error?.(`[MAX] Error handling bot_started: ${formatError(err)}`);
-        this.onError?.(err);
-      }
+      await this.handlePollingUpdate(ctx.update as MaxUpdate);
     });
 
     this.bot.on('message_created', async (ctx: any) => {
-      try {
-        const update = ctx.update as MaxUpdate;
-        const envelope = await normalizeMessage(update, this.mediaMaxMb);
-        if (envelope) {
-          this.lastPollOk = Date.now();
-          await this.onMessage(envelope);
-        }
-      } catch (err) {
-        this.logger.error?.(`[MAX] Error handling message_created: ${formatError(err)}`);
-        this.onError?.(err);
-      }
+      await this.handlePollingUpdate(ctx.update as MaxUpdate);
     });
 
     this.bot.on('message_edited', async (ctx: any) => {
-      try {
-        const update = ctx.update as MaxUpdate;
-        const envelope = await normalizeMessage(update, this.mediaMaxMb);
-        if (envelope) {
-          envelope.metadata.edited = true;
-          this.lastPollOk = Date.now();
-          await this.onMessage(envelope);
-        }
-      } catch (err) {
-        this.logger.error?.(`[MAX] Error handling message_edited: ${formatError(err)}`);
-        this.onError?.(err);
-      }
+      await this.handlePollingUpdate(ctx.update as MaxUpdate);
     });
 
     this.bot.on('message_callback', async (ctx: any) => {
-      try {
-        const update = ctx.update as MaxUpdate;
-        const envelope = normalizeCallback(update);
-        if (envelope) {
-          this.lastPollOk = Date.now();
-          await this.onMessage(envelope);
-        }
-      } catch (err) {
-        this.logger.error?.(`[MAX] Error handling message_callback: ${formatError(err)}`);
-        this.onError?.(err);
-      }
+      await this.handlePollingUpdate(ctx.update as MaxUpdate);
     });
 
     this.bot.catch((err: unknown) => {
@@ -192,9 +201,80 @@ export class MaxAdapter {
     });
   }
 
+  private async handlePollingUpdate(update: MaxUpdate): Promise<void> {
+    try {
+      const envelope = await this.normalizeUpdate(update);
+      if (envelope) {
+        this.lastPollOk = Date.now();
+        await this.onMessage(envelope);
+      }
+    } catch (err) {
+      this.logger.error?.(`[MAX] Error handling ${update?.update_type ?? 'update'}: ${formatError(err)}`);
+      this.onError?.(err);
+    }
+  }
+
+  async handleWebhookUpdate(update: MaxUpdate): Promise<void> {
+    if (this.stopped) return;
+
+    const key = webhookUpdateKey(update);
+    if (this.rememberWebhookUpdate(key)) {
+      this.logger.debug?.(`[MAX] Ignoring duplicate webhook update ${key}`);
+      return;
+    }
+
+    try {
+      const envelope = await this.normalizeUpdate(update);
+      if (envelope) {
+        await this.onMessage(envelope);
+      }
+    } catch (err) {
+      this.logger.error?.(`[MAX] Error handling webhook ${update?.update_type ?? 'update'}: ${formatError(err)}`);
+      this.onError?.(err);
+    }
+  }
+
+  private async normalizeUpdate(update: MaxUpdate): Promise<MessageEnvelope | null> {
+    switch (update.update_type) {
+      case 'bot_started':
+        return normalizeBotStarted(update);
+      case 'message_created':
+        return normalizeMessage(update, this.mediaMaxMb);
+      case 'message_edited': {
+        const envelope = await normalizeMessage(update, this.mediaMaxMb);
+        if (envelope) {
+          envelope.metadata.edited = true;
+        }
+        return envelope;
+      }
+      case 'message_callback':
+        return normalizeCallback(update);
+      default:
+        this.logger.debug?.(`[MAX] Unsupported update type: ${update.update_type}`);
+        return null;
+    }
+  }
+
+  private rememberWebhookUpdate(key: string): boolean {
+    if (this.seenWebhookUpdateKeys.has(key)) {
+      return true;
+    }
+
+    this.seenWebhookUpdateKeys.add(key);
+    this.seenWebhookUpdateQueue.push(key);
+
+    while (this.seenWebhookUpdateQueue.length > 1_000) {
+      const oldest = this.seenWebhookUpdateQueue.shift();
+      if (oldest) this.seenWebhookUpdateKeys.delete(oldest);
+    }
+
+    return false;
+  }
+
   private cleanupBot(): void {
     try { this.bot?.stop?.(); } catch { /* ignore */ }
     this.bot = null;
+    this.api = null;
   }
 
   private sleep(ms: number): Promise<void> {
@@ -220,6 +300,10 @@ export class MaxAdapter {
 
   getApi(): any {
     return this.api;
+  }
+
+  getConfig(): MaxAccountConfig {
+    return this.opts.config;
   }
 
   async sendText(

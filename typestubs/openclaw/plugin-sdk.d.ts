@@ -1,3 +1,5 @@
+import type { IncomingMessage, ServerResponse } from 'node:http';
+
 export interface OpenClawConfig {
   channels?: Record<string, unknown>;
   plugins?: Record<string, unknown>;
@@ -144,6 +146,15 @@ export interface OpenClawPluginApi {
     debug?: (...args: unknown[]) => void;
   };
   registerChannel: (opts: { plugin: unknown }) => void;
+  registerHttpRoute?: (route: {
+    path: string;
+    fallbackPath?: string;
+    replaceExisting?: boolean;
+    handler: (
+      req: IncomingMessage,
+      res: ServerResponse,
+    ) => void | boolean | Promise<void | boolean>;
+  }) => void | (() => void);
   registerGatewayMethod?: (method: string, handler: unknown) => void;
   registerCli?: (handler: unknown, opts?: unknown) => void;
   registerService?: (service: unknown) => void;

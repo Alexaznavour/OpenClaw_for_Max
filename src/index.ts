@@ -1,3 +1,4 @@
+import type { IncomingMessage, ServerResponse } from 'node:http';
 import type {
   OpenClawPluginApi,
   PluginRuntime,
@@ -11,9 +12,17 @@ import { emptyPluginConfigSchema } from 'openclaw/plugin-sdk';
 import { setRuntime, getRuntime } from './runtime.js';
 import { MaxAdapter } from './adapter.js';
 import { uploadAndSendMedia } from './media.js';
-import type { MaxAccountConfig, MessageEnvelope } from './types.js';
+import { createMaxSubscription, getMaxSubscriptions } from './subscriptions.js';
+import type { MaxAccountConfig, MaxUpdate, MessageEnvelope } from './types.js';
 
 const CHANNEL_ID = 'max';
+const DEFAULT_WEBHOOK_PATH = '/webhook/max';
+const DEFAULT_WEBHOOK_UPDATE_TYPES = [
+  'message_created',
+  'message_edited',
+  'message_callback',
+  'bot_started',
+];
 
 function formatError(err: unknown): string {
   if (err instanceof Error) return err.stack ?? err.message;
@@ -22,6 +31,222 @@ function formatError(err: unknown): string {
 }
 
 const adapters = new Map<string, MaxAdapter>();
+const registeredWebhookPaths = new Set<string>();
+let pluginApi: OpenClawPluginApi | null = null;
+
+function normalizeWebhookPath(path: string | undefined): string {
+  const raw = path?.trim() || DEFAULT_WEBHOOK_PATH;
+  const withLeadingSlash = raw.startsWith('/') ? raw : `/${raw}`;
+  return withLeadingSlash.replace(/\/+$/, '') || DEFAULT_WEBHOOK_PATH;
+}
+
+function resolveWebhookPath(account: MaxAccountConfig): string {
+  if (account.webhookPath) {
+    return normalizeWebhookPath(account.webhookPath);
+  }
+  if (account.webhookUrl) {
+    try {
+      return normalizeWebhookPath(new URL(account.webhookUrl).pathname);
+    } catch {
+      return DEFAULT_WEBHOOK_PATH;
+    }
+  }
+  return DEFAULT_WEBHOOK_PATH;
+}
+
+function resolveDeliveryMode(account: MaxAccountConfig): 'webhook' | 'polling' {
+  return account.deliveryMode ?? 'webhook';
+}
+
+function getHeader(req: IncomingMessage, name: string): string | undefined {
+  const value = req.headers[name.toLowerCase()];
+  if (Array.isArray(value)) return value[0];
+  return value;
+}
+
+function sendTextResponse(res: ServerResponse, statusCode: number, text: string): void {
+  res.statusCode = statusCode;
+  res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+  res.end(text);
+}
+
+async function readJsonBody(req: IncomingMessage, maxBytes = 1024 * 1024): Promise<unknown> {
+  const chunks: Buffer[] = [];
+  let total = 0;
+
+  for await (const chunk of req) {
+    const buffer = typeof chunk === 'string' ? Buffer.from(chunk) : Buffer.from(chunk);
+    total += buffer.length;
+    if (total > maxBytes) {
+      throw new Error('request body too large');
+    }
+    chunks.push(buffer);
+  }
+
+  return JSON.parse(Buffer.concat(chunks).toString('utf8')) as unknown;
+}
+
+function isMaxUpdate(value: unknown): value is MaxUpdate {
+  return Boolean(
+    value &&
+    typeof value === 'object' &&
+    typeof (value as MaxUpdate).update_type === 'string',
+  );
+}
+
+function findWebhookTarget(
+  req: IncomingMessage,
+  webhookPath: string,
+): { accountId: string; adapter: MaxAdapter } | null {
+  const requestUrl = new URL(req.url ?? webhookPath, 'http://localhost');
+  const requestedAccountId = requestUrl.searchParams.get('accountId');
+  const providedSecret = getHeader(req, 'x-max-bot-api-secret');
+
+  const candidates = [...adapters.entries()]
+    .filter(([, adapter]) => resolveWebhookPath(adapter.getConfig()) === webhookPath);
+
+  if (requestedAccountId) {
+    const adapter = adapters.get(requestedAccountId);
+    if (!adapter || resolveWebhookPath(adapter.getConfig()) !== webhookPath) {
+      return null;
+    }
+    const expectedSecret = adapter.getConfig().webhookSecret;
+    if (expectedSecret && providedSecret !== expectedSecret) {
+      return null;
+    }
+    return { accountId: requestedAccountId, adapter };
+  }
+
+  if (providedSecret) {
+    const secretMatches = candidates.filter(([, adapter]) =>
+      adapter.getConfig().webhookSecret === providedSecret,
+    );
+    if (secretMatches.length === 1) {
+      const [accountId, adapter] = secretMatches[0];
+      return { accountId, adapter };
+    }
+  }
+
+  if (candidates.length === 1) {
+    const [accountId, adapter] = candidates[0];
+    const expectedSecret = adapter.getConfig().webhookSecret;
+    if (expectedSecret && providedSecret !== expectedSecret) {
+      return null;
+    }
+    return { accountId, adapter };
+  }
+
+  return null;
+}
+
+function ensureWebhookRoute(webhookPath: string, log?: { info?: (...args: unknown[]) => void }): void {
+  if (registeredWebhookPaths.has(webhookPath)) return;
+  if (!pluginApi?.registerHttpRoute) {
+    throw new Error('OpenClaw runtime does not support plugin HTTP routes');
+  }
+
+  pluginApi.registerHttpRoute({
+    path: webhookPath,
+    replaceExisting: true,
+    handler: async (req: IncomingMessage, res: ServerResponse) => {
+      await handleMaxWebhookRequest(req, res, webhookPath);
+    },
+  });
+  registeredWebhookPaths.add(webhookPath);
+  log?.info?.(`[MAX] Registered webhook route ${webhookPath}`);
+}
+
+async function handleMaxWebhookRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  webhookPath: string,
+): Promise<void> {
+  if (req.method !== 'POST') {
+    res.setHeader('Allow', 'POST');
+    sendTextResponse(res, 405, 'Method Not Allowed');
+    return;
+  }
+
+  const contentType = getHeader(req, 'content-type') ?? '';
+  if (!contentType.toLowerCase().includes('application/json')) {
+    sendTextResponse(res, 415, 'Unsupported Media Type');
+    return;
+  }
+
+  const target = findWebhookTarget(req, webhookPath);
+  if (!target) {
+    sendTextResponse(res, 401, 'Unauthorized');
+    return;
+  }
+
+  let body: unknown;
+  try {
+    body = await readJsonBody(req);
+  } catch (err) {
+    sendTextResponse(res, 400, err instanceof Error ? err.message : 'Invalid JSON');
+    return;
+  }
+
+  if (!isMaxUpdate(body)) {
+    sendTextResponse(res, 400, 'Invalid MAX update');
+    return;
+  }
+
+  sendTextResponse(res, 200, 'OK');
+
+  void target.adapter.handleWebhookUpdate(body).catch((err) => {
+    console.error(`[MAX] Webhook processing failed for ${target.accountId}:`, err);
+  });
+}
+
+async function maybeConfigureWebhookSubscription(
+  account: MaxAccountConfig,
+  accountId: string,
+  log?: {
+    info?: (...args: unknown[]) => void;
+    warn?: (...args: unknown[]) => void;
+    debug?: (...args: unknown[]) => void;
+  },
+): Promise<void> {
+  if (account.autoSubscribe === false) {
+    log?.info?.(`[MAX] Auto-subscribe disabled for ${accountId}`);
+    return;
+  }
+  if (!account.webhookUrl) {
+    log?.warn?.(
+      `[MAX] No webhookUrl configured for ${accountId}; ` +
+      'create the MAX subscription manually or add webhookUrl',
+    );
+    return;
+  }
+  if (account.webhookSecret && !/^[a-zA-Z0-9_-]{5,256}$/.test(account.webhookSecret)) {
+    throw new Error('MAX webhookSecret must match /^[a-zA-Z0-9_-]{5,256}$/');
+  }
+  if (!account.webhookSecret) {
+    log?.warn?.(`[MAX] webhookSecret is not configured for ${accountId}`);
+  }
+
+  const updateTypes = account.webhookUpdateTypes?.length
+    ? account.webhookUpdateTypes
+    : DEFAULT_WEBHOOK_UPDATE_TYPES;
+  const client = {
+    token: account.botToken,
+  };
+
+  const subscriptions = await getMaxSubscriptions(client);
+  const existing = subscriptions.filter((sub) => sub.url === account.webhookUrl);
+  if (existing.length) {
+    log?.debug?.(`[MAX] Found ${existing.length} existing subscription(s) for ${account.webhookUrl}`);
+  }
+
+  await createMaxSubscription({
+    ...client,
+    url: account.webhookUrl,
+    updateTypes,
+    secret: account.webhookSecret,
+  });
+  log?.info?.(`[MAX] Webhook subscription configured for ${accountId}`);
+}
 
 const maxPlugin = {
   id: CHANNEL_ID,
@@ -41,6 +266,12 @@ const maxPlugin = {
       properties: {
         botToken: { type: 'string' },
         enabled: { type: 'boolean', default: true },
+        deliveryMode: { type: 'string', enum: ['webhook', 'polling'], default: 'webhook' },
+        webhookUrl: { type: 'string' },
+        webhookPath: { type: 'string', default: DEFAULT_WEBHOOK_PATH },
+        webhookSecret: { type: 'string' },
+        webhookUpdateTypes: { type: 'array', items: { type: 'string' } },
+        autoSubscribe: { type: 'boolean', default: true },
         dmPolicy: { type: 'string', default: 'open' },
         allowFrom: { type: 'array', items: { type: 'string' } },
         groupPolicy: { type: 'string', default: 'allowlist' },
@@ -79,17 +310,27 @@ const maxPlugin = {
       const channels = cfg.channels as any;
       const id = accountId ?? 'default';
 
-      // Try nested accounts form first, then flat form
-      const account = channels?.max?.accounts?.[id] ?? channels?.max ?? {};
+      // Try nested accounts form first, then flat form.
+      // Nested accounts inherit root MAX defaults such as webhookUrl/path.
+      const root = channels?.max ?? {};
+      const account = root.accounts?.[id] ?? {};
+      const inheritedRoot = root.accounts
+        ? Object.fromEntries(
+          Object.entries(root).filter(([key]) => key !== 'accounts'),
+        )
+        : root;
+      const resolvedAccount = root.accounts
+        ? { ...inheritedRoot, ...account }
+        : root;
 
       // Resolve token from config or env
       const botToken =
-        account.botToken ??
-        channels?.max?.botToken ??
+        resolvedAccount.botToken ??
+        root.botToken ??
         process.env.MAX_BOT_TOKEN ??
         '';
 
-      return { accountId: id, ...account, botToken };
+      return { accountId: id, ...resolvedAccount, botToken };
     },
   },
 
@@ -147,6 +388,8 @@ const maxPlugin = {
     ): Promise<unknown> => {
       const rt = getRuntime();
       const { cfg, accountId, account, abortSignal, log } = ctx;
+      const deliveryMode = resolveDeliveryMode(account);
+      const webhookPath = resolveWebhookPath(account);
 
       log?.info?.(`[MAX] startAccount called for ${accountId}`);
 
@@ -154,6 +397,8 @@ const maxPlugin = {
         accountId,
         running: true,
         connected: false,
+        deliveryMode,
+        ...(deliveryMode === 'webhook' ? { webhookPath, webhookUrl: account.webhookUrl } : {}),
         lastStartAt: Date.now(),
       });
 
@@ -173,10 +418,16 @@ const maxPlugin = {
             accountId,
             running: true,
             connected: true,
+            deliveryMode,
+            ...(deliveryMode === 'webhook' ? { webhookPath, webhookUrl: account.webhookUrl } : {}),
             lastConnectedAt: Date.now(),
             lastError: null,
           });
-          log?.info?.('[MAX] Bot connected and polling');
+          log?.info?.(
+            deliveryMode === 'webhook'
+              ? '[MAX] Bot connected and ready for webhooks'
+              : '[MAX] Bot connected and polling',
+          );
         },
 
         onError: (err) => {
@@ -412,9 +663,36 @@ const maxPlugin = {
 
       adapters.set(accountId, adapter);
 
-      log?.info?.('[MAX] Starting adapter...');
-      await adapter.start();
-      log?.info?.('[MAX] Adapter started');
+      if (deliveryMode === 'webhook') {
+        ensureWebhookRoute(webhookPath, log);
+        log?.info?.('[MAX] Starting webhook adapter...');
+        await adapter.startWebhook();
+        try {
+          await maybeConfigureWebhookSubscription(account, accountId, log);
+        } catch (err) {
+          const detail = formatError(err);
+          log?.warn?.(`[MAX] Webhook auto-subscribe failed for ${accountId}: ${detail}`);
+          ctx.setStatus({
+            ...ctx.getStatus(),
+            lastError: detail,
+            lastErrorAt: Date.now(),
+          });
+        }
+        log?.info?.('[MAX] Webhook adapter started');
+      } else {
+        log?.warn?.(
+          '[MAX] Starting Long Polling fallback. MAX limits Long Polling to 2 RPS, ' +
+          '30s timeout, 100 events per batch, and 24h event TTL.',
+        );
+        void adapter.startPolling().catch((err) => {
+          log?.error?.(`[MAX] Polling adapter failed: ${formatError(err)}`);
+          ctx.setStatus({
+            ...ctx.getStatus(),
+            lastError: formatError(err),
+            lastErrorAt: Date.now(),
+          });
+        });
+      }
 
       // Keep-alive promise: stays pending until abort signal fires.
       // Same pattern as the reference openclawcity plugin and built-in channels.
@@ -571,6 +849,7 @@ const plugin = {
   name: 'MAX Messenger Channel',
   configSchema: emptyPluginConfigSchema(),
   register(api: OpenClawPluginApi): void {
+    pluginApi = api;
     setRuntime(api.runtime);
     api.registerChannel({ plugin: maxPlugin });
   },
